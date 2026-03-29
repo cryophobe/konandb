@@ -637,6 +637,9 @@ class Collection:
     def _load(self):
         if self._shards is not None:
             return
+        # Wait for the HF repo bootstrap to complete before hitting the network
+        if not self._db._repo_ready.wait(timeout=60):
+            print(f"[KonanDB][WARN] Repo bootstrap timed out — proceeding anyway for '{self.name}'")
         self._shards = []
 
         # Discover existing shard files
@@ -1413,7 +1416,20 @@ class KonanDB:
         self.load_workers = load_workers
         self._token = hf_token
         self._store = _HFStore(repo_id, hf_token)
-        self._store._ensure_repo(private=private)   # create repo + seed SHA
+        self._repo_ready = threading.Event()
+
+        # Bootstrap HF repo in the background — server can bind immediately
+        def _bootstrap():
+            try:
+                self._store._ensure_repo(private=private)
+                print(f"[KonanDB] Repo ready: {repo_id}")
+            except Exception as exc:
+                print(f"[KonanDB][ERROR] Repo bootstrap failed: {exc}")
+            finally:
+                self._repo_ready.set()
+
+        threading.Thread(target=_bootstrap, daemon=True, name="konandb-bootstrap").start()
+
         self._collections: Dict[str, Collection] = {}
         self._dirty_collections: set = set()
         self._lock = threading.Lock()
@@ -1489,6 +1505,8 @@ class KonanDB:
         Only one thread, no matter how many collections trigger it.
         """
         def _loop():
+            # Don't attempt any flush until the HF repo bootstrap has finished
+            self._repo_ready.wait()
             while True:
                 # Wait up to *interval* seconds OR until signalled by op-limit
                 triggered = self._flush_event.wait(timeout=interval if interval > 0 else 3600)
@@ -1897,7 +1915,7 @@ def start_server(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Quick demo  (python konandb.py)
+# Entry point  (python konandb.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1905,61 +1923,35 @@ if __name__ == "__main__":
 
     token    = os.getenv("HF_TOKEN")
     username = os.getenv("HF_USERNAME", "myuser")
-    mode     = sys.argv[1] if len(sys.argv) > 1 else "server"  # "server" | "demo"
+    repo_name = os.getenv("HF_REPO", "konandb-data")
 
     if not token:
-        print("Set HF_TOKEN (and optionally HF_USERNAME) env vars first.")
+        print("[KonanDB] ERROR: Set the HF_TOKEN environment variable first.")
+        print("          export HF_TOKEN=hf_...")
         sys.exit(1)
 
-    repo = f"{username}/konandb-demo"
-    print(f"\n── Connecting to KonanDB: {repo} ──\n")
+    repo = f"{username}/{repo_name}"
+    host = os.getenv("KONANDB_HOST", "0.0.0.0")
+    port = int(os.getenv("KONANDB_PORT", "5000"))
 
+    print(f"[KonanDB] Initialising — repo: {repo}")
+    print(f"[KonanDB] Server will listen on http://{host}:{port}")
+    print(f"[KonanDB] HF repo bootstrap running in background...")
+
+    # Initialise KonanDB in a background thread so the Socket.IO server
+    # can bind its port immediately while the HF repo check / creation
+    # happens concurrently.  The server accepts connections straight away;
+    # the first collection access will block only until the background init
+    # finishes (the Collection._load() path already handles lazy loading).
     db = KonanDB(
         repo_id             = repo,
         hf_token            = token,
-        auto_flush_interval = 0 if mode == "demo" else 120,
-        flush_after_ops     = 500,
-        shard_size          = 100,   # small for demo — use 1000+ in prod
+        auto_flush_interval = int(os.getenv("KONANDB_FLUSH_INTERVAL", "120")),
+        flush_after_ops     = int(os.getenv("KONANDB_FLUSH_OPS",      "500")),
+        shard_size          = int(os.getenv("KONANDB_SHARD_SIZE",     "1000")),
+        private             = os.getenv("KONANDB_PRIVATE", "false").lower() == "true",
+        scan_workers        = int(os.getenv("KONANDB_SCAN_WORKERS",   "8")),
+        load_workers        = int(os.getenv("KONANDB_LOAD_WORKERS",   "8")),
     )
 
-    if mode == "demo":
-        # ── Quick local smoke-test (no networking) ──────────────────────────
-        users = db.collection("users")
-
-        users.insert_one({"name": "Ada",    "age": 30, "role": "admin",  "city": "Lagos"})
-        users.insert_one({"name": "Brian",  "age": 25, "role": "user",   "city": "London"})
-        users.insert_one({"name": "Chioma", "age": 28, "role": "admin",  "city": "Lagos"})
-        users.insert_many([
-            {"name": "Dave",  "age": 35, "role": "user",  "city": "Paris"},
-            {"name": "Emeka", "age": 22, "role": "user",  "city": "Lagos"},
-        ])
-
-        print("All users:", users.count_documents())
-        print("Admins:",    [u["name"] for u in users.find({"role": "admin"})])
-        print("Age < 28:",  [u["name"] for u in users.find({"age": {"$lt": 28}})])
-
-        users.create_index("city")
-        print("Lagos:",     [u["name"] for u in users.find({"city": "Lagos"})])
-
-        users.update_one({"name": "Ada"}, {"$set": {"age": 31}, "$inc": {"login_count": 1}})
-        print("Ada updated:", users.find_one({"name": "Ada"}))
-
-        by_city = users.aggregate([
-            {"$group": {"_id": "$city", "count": {"$sum": 1}}},
-            {"$sort":  {"count": -1}},
-        ])
-        print("Users by city:", by_city)
-        print("All cities:", users.distinct("city"))
-
-        users.delete_one({"name": "Dave"})
-        print("After delete Dave:", users.count_documents())
-
-        print("\nFlushing to HuggingFace...")
-        db.flush()
-        print("Done! Check:", f"https://huggingface.co/datasets/{repo}")
-
-    else:
-        # ── Start Socket.IO server ──────────────────────────────────────────
-        host = os.getenv("KONANDB_HOST", "0.0.0.0")
-        port = int(os.getenv("KONANDB_PORT", "7860"))
-        start_server(db, host=host, port=port)
+    start_server(db, host=host, port=port)
